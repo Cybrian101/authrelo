@@ -2,14 +2,17 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import { Send, Users, ArrowRight } from "lucide-react";
 import { QUESTIONS, MIN_ANSWER_LENGTH, LOADING_MESSAGES } from "@/lib/constants";
-import { detectAbuse } from "@/lib/abuseClassifier";
+import { classifyText } from "@/lib/abuseClassifier";
+import { track, EVENTS } from "@/lib/analytics";
+import { useLocale } from "@/hooks/useLocale";
 import ChatBubble from "@/components/ChatBubble";
 import TypingIndicator from "@/components/TypingIndicator";
 import ProgressBar from "@/components/ProgressBar";
 import VoiceButton from "@/components/VoiceButton";
+import SafetyCheck from "@/components/SafetyCheck";
 import { useVoiceInput } from "@/hooks/useVoiceInput";
 import { Button } from "@/components/ui/button";
 import { Message } from "@/types";
@@ -18,6 +21,7 @@ type CouplePhase = "intro" | "partner1" | "switch" | "partner2" | "analysing";
 
 export default function CouplePage() {
   const router = useRouter();
+  const { t } = useLocale();
   const [phase, setPhase] = useState<CouplePhase>("intro");
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
@@ -26,6 +30,8 @@ export default function CouplePage() {
   const [partner2Answers, setPartner2Answers] = useState<string[]>([]);
   const [isTyping, setIsTyping] = useState(false);
   const [loadingMsgIndex, setLoadingMsgIndex] = useState(0);
+  const [showSafetyCheck, setShowSafetyCheck] = useState(false);
+  const [pendingAnswer, setPendingAnswer] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -66,7 +72,6 @@ export default function CouplePage() {
     [addLocalMessage, scrollToBottom]
   );
 
-  // Start partner's session
   function startPartnerSession(partner: 1 | 2) {
     setMessages([]);
     setCurrentStep(0);
@@ -75,7 +80,6 @@ export default function CouplePage() {
     setTimeout(() => showQuestion(0), 500);
   }
 
-  // Loading messages rotation
   useEffect(() => {
     if (phase !== "analysing") return;
     const interval = setInterval(() => {
@@ -90,15 +94,13 @@ export default function CouplePage() {
 
   async function handleAnalysis() {
     setPhase("analysing");
+    track(EVENTS.ANALYSIS_STARTED, { mode: "couple" });
 
     try {
       const res = await fetch("/api/couple-analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          partner1Answers,
-          partner2Answers,
-        }),
+        body: JSON.stringify({ partner1Answers, partner2Answers }),
       });
 
       if (!res.ok) throw new Error("Analysis failed");
@@ -109,11 +111,8 @@ export default function CouplePage() {
         return;
       }
 
-      // Store couple result
-      sessionStorage.setItem(
-        "authrelo_couple_result",
-        JSON.stringify(result)
-      );
+      track(EVENTS.ANALYSIS_COMPLETE, { mode: "couple" });
+      sessionStorage.setItem("authrelo_couple_result", JSON.stringify(result));
       sessionStorage.setItem(
         "authrelo_session",
         JSON.stringify({
@@ -127,19 +126,12 @@ export default function CouplePage() {
     } catch (err) {
       console.error(err);
       addLocalMessage("ai", "Something went wrong. Please try again.");
+      // Go back to the correct phase — partner2, since analysis only runs after partner2 finishes
       setPhase("partner2");
     }
   }
 
-  function handleSubmit() {
-    const trimmed = input.trim();
-    if (trimmed.length < MIN_ANSWER_LENGTH || isTyping) return;
-
-    if (detectAbuse(trimmed)) {
-      router.push("/crisis");
-      return;
-    }
-
+  function processAnswer(trimmed: string) {
     addLocalMessage("user", trimmed);
 
     const isPartner1 = phase === "partner1";
@@ -151,6 +143,12 @@ export default function CouplePage() {
     } else {
       setPartner2Answers(newAnswers);
     }
+
+    track(EVENTS.QUESTION_ANSWERED, {
+      step: currentStep + 1,
+      mode: "couple",
+      partner: isPartner1 ? 1 : 2,
+    });
 
     const newStep = currentStep + 1;
     setCurrentStep(newStep);
@@ -176,6 +174,42 @@ export default function CouplePage() {
     }
   }
 
+  function handleSubmit() {
+    const trimmed = input.trim();
+    if (trimmed.length < MIN_ANSWER_LENGTH || isTyping) return;
+
+    const classification = classifyText(trimmed);
+
+    if (classification.level === "crisis") {
+      track(EVENTS.ABUSE_DETECTED, { pattern: classification.matchedPattern, mode: "couple" });
+      router.push("/crisis");
+      return;
+    }
+
+    if (classification.level === "borderline") {
+      setPendingAnswer(trimmed);
+      setShowSafetyCheck(true);
+      return;
+    }
+
+    if (navigator.vibrate) navigator.vibrate(20);
+    processAnswer(trimmed);
+  }
+
+  function handleSafetyCheckSafe() {
+    setShowSafetyCheck(false);
+    if (pendingAnswer) {
+      processAnswer(pendingAnswer);
+      setPendingAnswer(null);
+    }
+  }
+
+  function handleSafetyCheckNeedHelp() {
+    setShowSafetyCheck(false);
+    setPendingAnswer(null);
+    router.push("/crisis");
+  }
+
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -184,6 +218,19 @@ export default function CouplePage() {
   }
 
   const canSubmit = input.trim().length >= MIN_ANSWER_LENGTH && !isTyping;
+
+  // Safety check overlay
+  if (showSafetyCheck) {
+    return (
+      <AnimatePresence>
+        <SafetyCheck
+          onSafe={handleSafetyCheckSafe}
+          onNeedHelp={handleSafetyCheckNeedHelp}
+          t={t as (key: string) => string}
+        />
+      </AnimatePresence>
+    );
+  }
 
   // Intro screen
   if (phase === "intro") {
@@ -199,45 +246,35 @@ export default function CouplePage() {
           </div>
           <div className="space-y-3">
             <h1 className="text-xl font-medium text-text-primary">
-              Couple Mode
+              {t("coupleMode")}
             </h1>
             <p className="text-text-secondary text-[15px] leading-relaxed">
-              Both partners answer the same 5 questions separately. The AI
-              compares your patterns and shows where they collide.
+              {t("coupleModeDesc")}
             </p>
           </div>
           <div className="space-y-3 text-left">
             <div className="bg-bg-card border border-border rounded-card p-4 flex items-center gap-3">
-              <span className="w-8 h-8 rounded-full bg-accent/10 flex items-center justify-center text-accent text-sm font-medium">
-                1
-              </span>
-              <span className="text-text-secondary text-sm">
-                Partner 1 answers 5 questions
-              </span>
+              <span className="w-8 h-8 rounded-full bg-accent/10 flex items-center justify-center text-accent text-sm font-medium">1</span>
+              <span className="text-text-secondary text-sm">{t("couplePartner1")} answers 5 questions</span>
             </div>
             <div className="bg-bg-card border border-border rounded-card p-4 flex items-center gap-3">
-              <span className="w-8 h-8 rounded-full bg-accent/10 flex items-center justify-center text-accent text-sm font-medium">
-                2
-              </span>
-              <span className="text-text-secondary text-sm">
-                Hand the phone to Partner 2
-              </span>
+              <span className="w-8 h-8 rounded-full bg-accent/10 flex items-center justify-center text-accent text-sm font-medium">2</span>
+              <span className="text-text-secondary text-sm">{t("coupleSwitchPrompt")}</span>
             </div>
             <div className="bg-bg-card border border-border rounded-card p-4 flex items-center gap-3">
-              <span className="w-8 h-8 rounded-full bg-accent/10 flex items-center justify-center text-accent text-sm font-medium">
-                3
-              </span>
-              <span className="text-text-secondary text-sm">
-                See how your patterns connect
-              </span>
+              <span className="w-8 h-8 rounded-full bg-accent/10 flex items-center justify-center text-accent text-sm font-medium">3</span>
+              <span className="text-text-secondary text-sm">See how your patterns connect</span>
             </div>
           </div>
           <Button
-            onClick={() => startPartnerSession(1)}
+            onClick={() => {
+              track(EVENTS.COUPLE_MODE_START);
+              startPartnerSession(1);
+            }}
             className="w-full"
             size="lg"
           >
-            Start — Partner 1 goes first
+            {t("coupleModeStart")}
           </Button>
         </motion.div>
       </main>
@@ -258,10 +295,10 @@ export default function CouplePage() {
           </div>
           <div className="space-y-3">
             <h2 className="text-xl font-medium text-text-primary">
-              Partner 1 is done!
+              {t("couplePartner1")} is done!
             </h2>
             <p className="text-text-secondary text-[15px] leading-relaxed">
-              Now hand the phone to your partner. Their answers are completely
+              {t("coupleSwitchPrompt")}. Their answers are completely
               separate — neither of you will see each other&apos;s responses.
             </p>
           </div>
@@ -270,7 +307,7 @@ export default function CouplePage() {
             className="w-full"
             size="lg"
           >
-            Start Partner 2&apos;s turn
+            Start {t("couplePartner2")}&apos;s turn
           </Button>
         </motion.div>
       </main>
@@ -289,7 +326,7 @@ export default function CouplePage() {
           </div>
           <div className="space-y-3">
             <h2 className="text-lg font-medium text-text-primary">
-              Comparing both perspectives...
+              {t("coupleComparing")}
             </h2>
             <p
               key={loadingMsgIndex}
@@ -304,13 +341,13 @@ export default function CouplePage() {
   }
 
   // Chat interface
-  const partnerLabel = phase === "partner1" ? "Partner 1" : "Partner 2";
+  const partnerLabel = phase === "partner1" ? t("couplePartner1") : t("couplePartner2");
 
   return (
     <main className="h-dvh bg-bg-primary flex flex-col max-w-mobile mx-auto">
       <header className="flex-shrink-0 px-4 pt-4 pb-3 space-y-3 border-b border-border">
         <div className="flex items-center justify-between">
-          <span className="text-accent font-medium text-lg">AuthRelo</span>
+          <span className="text-accent font-medium text-lg">{t("brandName")}</span>
           <span className="text-xs px-2 py-1 rounded-pill bg-accent/10 text-accent border border-accent-border">
             {partnerLabel}
           </span>
@@ -341,12 +378,14 @@ export default function CouplePage() {
               <VoiceButton
                 isListening={isListening}
                 isSupported={isSupported}
-                onStart={() =>
+                onStart={() => {
+                  track(EVENTS.VOICE_INPUT_USED, { mode: "couple" });
                   startListening((text) =>
-                    setInput((prev) => prev + " " + text)
-                  )
-                }
+                    setInput((prev) => (prev ? prev + " " + text : text))
+                  );
+                }}
                 onStop={stopListening}
+                label={isListening ? t("voiceListening") : t("voiceTap")}
               />
             )}
             <div className="flex-1 relative">
@@ -355,7 +394,7 @@ export default function CouplePage() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Type your answer..."
+                placeholder={t("typeAnswer")}
                 rows={1}
                 className="w-full bg-bg-card border border-border rounded-input px-4 py-3 text-[15px] text-text-primary placeholder:text-text-muted resize-none focus:outline-none focus:border-accent-border transition-colors min-h-[44px] max-h-32 leading-relaxed"
                 onInput={(e) => {
@@ -375,6 +414,12 @@ export default function CouplePage() {
               <Send className="w-5 h-5" />
             </button>
           </div>
+          {input.trim().length > 0 &&
+            input.trim().length < MIN_ANSWER_LENGTH && (
+              <p className="text-text-muted text-xs mt-2 px-1">
+                {t("minChars")}
+              </p>
+            )}
         </div>
       )}
     </main>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { Gift, Copy, Check } from "lucide-react";
 import { Button } from "./ui/button";
 import { track, EVENTS } from "@/lib/analytics";
@@ -12,11 +12,11 @@ interface ReferralCardProps {
 export default function ReferralCard({ t }: ReferralCardProps) {
   const [copied, setCopied] = useState(false);
 
-  // Generate a simple referral code from timestamp
-  const referralCode =
-    typeof window !== "undefined"
-      ? `AR${Math.random().toString(36).slice(2, 8).toUpperCase()}`
-      : "AR000000";
+  // Generate referral code once per mount — not on every render
+  const referralCode = useMemo(
+    () => `AR${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+    []
+  );
 
   const referralLink = `https://authrelo.com?ref=${referralCode}`;
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 
 interface SpeechRecognitionEvent {
   results: SpeechRecognitionResultList;
@@ -23,15 +23,13 @@ export function useVoiceInput() {
   const [isSupported, setSupported] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
-  // Check support on first call
-  const checkSupport = useCallback(() => {
-    if (typeof window === "undefined") return false;
+  // Check support once on mount — not during render
+  useEffect(() => {
+    if (typeof window === "undefined") return;
     const SpeechRecognition =
       (window as unknown as Record<string, unknown>).SpeechRecognition ||
       (window as unknown as Record<string, unknown>).webkitSpeechRecognition;
-    const supported = !!SpeechRecognition;
-    setSupported(supported);
-    return supported;
+    setSupported(!!SpeechRecognition);
   }, []);
 
   const startListening = useCallback(
@@ -74,7 +72,6 @@ export function useVoiceInput() {
       recognition.start();
       setIsListening(true);
 
-      // Haptic feedback
       if (navigator.vibrate) {
         navigator.vibrate(50);
       }
@@ -89,7 +86,7 @@ export function useVoiceInput() {
 
   return {
     isListening,
-    isSupported: typeof window !== "undefined" ? isSupported || checkSupport() : false,
+    isSupported,
     startListening,
     stopListening,
   };
